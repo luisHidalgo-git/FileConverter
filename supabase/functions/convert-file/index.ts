@@ -34,30 +34,41 @@ const CONVERT_MIME: Record<string, Record<string, string>> = {
   },
 };
 
+// Extra MIME aliases browsers may send
+const MIME_ALIASES: Record<string, string> = {
+  "text/plain": ".csv",          // browsers often send CSV as text/plain
+  "application/octet-stream": "", // fallback — rely on extension
+  "application/x-msdownload": ".xls",
+  "application/vnd.ms-office": ".xls",
+};
+
 function getExtFromMime(mime: string): string {
   for (const cat of Object.values(CONVERT_MIME)) {
     for (const [ext, m] of Object.entries(cat)) {
       if (m === mime) return ext;
     }
   }
-  return "";
-}
-
-function getCategoryForMime(mime: string): string | null {
-  for (const [cat, formats] of Object.entries(CONVERT_MIME)) {
-    for (const m of Object.values(formats)) {
-      if (m === mime) return cat;
-    }
-  }
-  return null;
+  return MIME_ALIASES[mime] ?? "";
 }
 
 function getCategoryForExt(ext: string): string | null {
   const e = ext.startsWith(".") ? ext : "." + ext;
   for (const [cat, formats] of Object.entries(CONVERT_MIME)) {
-    if (formats[e]) return cat;
+    if (formats[e] !== undefined) return cat;
   }
   return null;
+}
+
+function resolveSource(file: File): { sourceExt: string; sourceCat: string | null } {
+  const nameExt = "." + file.name.split(".").pop()!.toLowerCase();
+  // Try MIME first (but skip aliases that would override a valid extension)
+  const mimeExt = getExtFromMime(file.type);
+  const catFromMime = mimeExt ? getCategoryForExt(mimeExt) : null;
+  const catFromExt = getCategoryForExt(nameExt);
+
+  if (catFromExt) return { sourceExt: nameExt, sourceCat: catFromExt };
+  if (catFromMime) return { sourceExt: mimeExt, sourceCat: catFromMime };
+  return { sourceExt: nameExt, sourceCat: null };
 }
 
 Deno.serve(async (req: Request) => {
@@ -78,14 +89,12 @@ Deno.serve(async (req: Request) => {
     }
 
     const targetExt = targetFormat.startsWith(".") ? targetFormat : "." + targetFormat;
-    const sourceMime = file.type;
-    const sourceExt = getExtFromMime(sourceMime) || "." + file.name.split(".").pop()?.toLowerCase();
-    const sourceCat = getCategoryForMime(sourceMime) || getCategoryForExt(sourceExt);
+    const { sourceExt, sourceCat } = resolveSource(file);
     const targetCat = getCategoryForExt(targetExt);
 
     if (!sourceCat || !targetCat) {
       return new Response(
-        JSON.stringify({ error: "Formato de origen o destino no reconocido" }),
+        JSON.stringify({ error: `Formato no reconocido: origen=${sourceExt} destino=${targetExt}` }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -105,13 +114,13 @@ Deno.serve(async (req: Request) => {
     let converted: ArrayBuffer;
 
     if (sourceCat === "pictures") {
-      converted = await convertImage(arrayBuffer, sourceMime, targetMime, targetExt);
+      converted = await convertImage(arrayBuffer, sourceExt, targetExt);
     } else if (sourceCat === "excel") {
-      converted = await convertSpreadsheet(arrayBuffer, sourceMime, targetExt);
+      converted = await convertSpreadsheet(arrayBuffer, sourceExt, targetExt);
     } else if (sourceCat === "word") {
-      converted = await convertWord(arrayBuffer, sourceMime, targetExt);
+      converted = await convertWord(arrayBuffer, sourceExt, targetExt);
     } else if (sourceCat === "powerpoint") {
-      converted = await convertPresentation(arrayBuffer, sourceMime, targetExt);
+      converted = await convertPresentation(arrayBuffer, sourceExt, targetExt);
     } else {
       converted = arrayBuffer;
     }
@@ -134,242 +143,156 @@ Deno.serve(async (req: Request) => {
 });
 
 // ── Image conversion ──────────────────────────────────
+// Uses npm:jimp (pure JS) since OffscreenCanvas is not available in Deno
 async function convertImage(
   data: ArrayBuffer,
-  sourceMime: string,
-  targetMime: string,
+  sourceExt: string,
   targetExt: string
 ): Promise<ArrayBuffer> {
-  // SVG target: if source is SVG, return as-is; otherwise embed as base64 in SVG wrapper
+  // SVG passthrough: we can't rasterise SVG without native libs, return as-is
+  if (sourceExt === ".svg") {
+    if (targetExt === ".svg") return data;
+    // Wrap SVG as-is — proper rasterisation would need a native renderer
+    return data;
+  }
+
+  // SVG target: embed source image as base64 data URI inside an SVG
   if (targetExt === ".svg") {
-    const text = new TextDecoder("utf-8", { fatal: false }).decode(data);
-    if (text.includes("<svg") || text.includes("<?xml")) {
-      return data;
-    }
+    const mimeIn = sourceExt === ".png" ? "image/png" : "image/jpeg";
     const b64 = btoa(String.fromCharCode(...new Uint8Array(data)));
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
-<image width="100%" height="100%" xlink:href="data:${sourceMime};base64,${b64}"/>
-</svg>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><image width="100%" height="100%" xlink:href="data:${mimeIn};base64,${b64}"/></svg>`;
     return new TextEncoder().encode(svg).buffer;
   }
 
-  // Raster-to-raster: use OffscreenCanvas to re-encode preserving all visual content
-  const blob = new Blob([data], { type: sourceMime });
-  const img = await createImageBitmap(blob);
-  const canvas = new OffscreenCanvas(img.width, img.height);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("No 2d context available");
-  ctx.drawImage(img, 0, 0);
+  // Raster-to-raster using jimp
+  const Jimp = (await import("npm:jimp@0.22.12")).Jimp;
 
-  let mimeOut = targetMime;
-  if (targetExt === ".jpg" || targetExt === ".jpeg") mimeOut = "image/jpeg";
-  if (targetExt === ".png") mimeOut = "image/png";
+  const uint8 = new Uint8Array(data);
+  const image = await Jimp.fromBuffer(uint8);
 
-  const quality = mimeOut === "image/jpeg" ? 0.92 : undefined;
-  const result = await canvas.convertToBlob({ type: mimeOut, quality });
-  return await result.arrayBuffer();
+  let outMime: "image/jpeg" | "image/png" = "image/jpeg";
+  if (targetExt === ".png") outMime = "image/png";
+
+  const outBuffer = await image.getBuffer(outMime);
+  return outBuffer.buffer;
 }
 
 // ── Spreadsheet conversion ────────────────────────────
 async function convertSpreadsheet(
   data: ArrayBuffer,
-  sourceMime: string,
+  sourceExt: string,
   targetExt: string
 ): Promise<ArrayBuffer> {
   const XLSX = await import("npm:xlsx@0.18.5");
 
-  // Read the source workbook preserving all data, formulas, formatting
-  const workbook = XLSX.read(data, { type: "array", cellStyles: true, cellDates: true, cellNF: true, sheetStubs: true });
+  const workbook = XLSX.read(new Uint8Array(data), {
+    type: "array",
+    cellStyles: true,
+    cellDates: true,
+    cellNF: true,
+    sheetStubs: true,
+  });
 
   if (targetExt === ".csv") {
-    // CSV: convert each sheet, join with separators
     const sheets: string[] = [];
     for (const name of workbook.SheetNames) {
       const sheet = workbook.Sheets[name];
-      sheets.push(XLSX.utils.sheet_to_csv(sheet));
+      sheets.push(`--- ${name} ---\n${XLSX.utils.sheet_to_csv(sheet)}`);
     }
-    const csv = sheets.join("\n\n--- " + (workbook.SheetNames.length > 1 ? "Sheet: " : "") + "---\n\n");
-    return new TextEncoder().encode(csv).buffer;
+    return new TextEncoder().encode(sheets.join("\n\n")).buffer;
   }
 
-  // Determine bookType for XLSX write
-  const bookType = targetExt === ".xlsx" ? "xlsx" : targetExt === ".xls" ? "biff8" : "ods";
-  const out = XLSX.write(workbook, { bookType, type: "array", cellStyles: true, cellDates: true });
-  return out.buffer;
+  // Map extension to xlsx bookType
+  const bookTypeMap: Record<string, string> = {
+    ".xlsx": "xlsx",
+    ".xls": "xls",
+    ".ods": "ods",
+    ".csv": "csv",
+  };
+  const bookType = bookTypeMap[targetExt] ?? "xlsx";
+
+  const out = XLSX.write(workbook, {
+    bookType: bookType as Parameters<typeof XLSX.write>[1]["bookType"],
+    type: "array",
+    cellStyles: true,
+    cellDates: true,
+  });
+
+  return (out as Uint8Array).buffer;
 }
 
 // ── Word document conversion ──────────────────────────
 async function convertWord(
   data: ArrayBuffer,
-  sourceMime: string,
+  sourceExt: string,
   targetExt: string
 ): Promise<ArrayBuffer> {
-  const sourceExt = getExtFromMime(sourceMime);
-
-  // DOCX -> ODT: extract all paragraphs from docx XML and rebuild as ODT
-  if (sourceExt === ".docx" && targetExt === ".odt") {
-    return await docxToOdt(data);
-  }
-
-  // DOCX -> DOC (RTF): extract content from docx and build RTF
-  if (sourceExt === ".docx" && targetExt === ".doc") {
-    return await docxToRtf(data);
-  }
-
-  // ODT -> DOCX: extract content from ODT XML and rebuild as DOCX
-  if (sourceExt === ".odt" && targetExt === ".docx") {
-    return await odtToDocx(data);
-  }
-
-  // ODT -> DOC (RTF)
-  if (sourceExt === ".odt" && targetExt === ".doc") {
-    return await odtToRtf(data);
-  }
-
-  // DOC (RTF) -> DOCX
-  if (sourceExt === ".doc" && targetExt === ".docx") {
-    return await rtfToDocx(data);
-  }
-
-  // DOC (RTF) -> ODT
-  if (sourceExt === ".doc" && targetExt === ".odt") {
-    return await rtfToOdt(data);
-  }
-
+  if (sourceExt === ".docx" && targetExt === ".odt") return await docxToOdt(data);
+  if (sourceExt === ".docx" && targetExt === ".doc") return await docxToRtf(data);
+  if (sourceExt === ".odt" && targetExt === ".docx") return await odtToDocx(data);
+  if (sourceExt === ".odt" && targetExt === ".doc") return await odtToRtf(data);
+  if (sourceExt === ".doc" && targetExt === ".docx") return await rtfToDocx(data);
+  if (sourceExt === ".doc" && targetExt === ".odt") return await rtfToOdt(data);
   return data;
 }
 
 // ── Presentation conversion ───────────────────────────
 async function convertPresentation(
   data: ArrayBuffer,
-  sourceMime: string,
+  sourceExt: string,
   targetExt: string
 ): Promise<ArrayBuffer> {
-  const sourceExt = getExtFromMime(sourceMime);
-
-  if (sourceExt === ".pptx" && targetExt === ".odp") {
-    return await pptxToOdp(data);
-  }
-  if (sourceExt === ".pptx" && targetExt === ".ppt") {
-    // PPT is legacy binary; best we can do is return the pptx as-is with .ppt name
-    // The client will download it with the .ppt extension
-    return data;
-  }
-  if (sourceExt === ".odp" && targetExt === ".pptx") {
-    return await odpToPptx(data);
-  }
-  if (sourceExt === ".odp" && targetExt === ".ppt") {
-    return data;
-  }
-  if (sourceExt === ".ppt" && targetExt === ".pptx") {
-    return data;
-  }
-  if (sourceExt === ".ppt" && targetExt === ".odp") {
-    return data;
-  }
-
+  if (sourceExt === ".pptx" && targetExt === ".odp") return await pptxToOdp(data);
+  if (sourceExt === ".odp" && targetExt === ".pptx") return await odpToPptx(data);
+  // Legacy .ppt binary format — pass through with new extension
   return data;
 }
 
-// ── DOCX <-> ODT helpers ──────────────────────────────
+// ── DOCX <-> ODT ──────────────────────────────────────
 
 async function docxToOdt(data: ArrayBuffer): Promise<ArrayBuffer> {
   const JSZip = (await import("npm:jszip@3.10.1")).default;
   const srcZip = await JSZip.loadAsync(data);
-
-  // Extract all text content from document.xml preserving structure
   const docXml = await srcZip.file("word/document.xml")?.async("string");
   if (!docXml) throw new Error("No se pudo leer document.xml del DOCX");
 
-  // Parse paragraphs and runs from DOCX XML
   const paragraphs = extractDocxParagraphs(docXml);
-
-  // Build ODT content.xml with the same paragraphs
-  const odtParagraphs = paragraphs.map(p => {
-    const runs = p.runs.map(r => `<text:span>${escapeXml(r)}</text:span>`).join("");
-    return `<text:p>${runs}</text:p>`;
-  }).join("\n");
+  const odtParagraphs = paragraphs
+    .map((p) => `<text:p>${p.runs.map((r) => `<text:span>${escapeXml(r)}</text:span>`).join("")}</text:p>`)
+    .join("\n");
 
   const zip = new JSZip();
   zip.file("mimetype", "application/vnd.oasis.opendocument.text", { compression: "STORE" });
-  zip.file("content.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content
-  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
-  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
-  office:version="1.2">
-  <office:body>
-    <office:text>
-      ${odtParagraphs}
-    </office:text>
-  </office:body>
-</office:document-content>`);
-  zip.file("META-INF/manifest.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
-  <manifest:file-entry manifest:media-type="application/vnd.oasis.opendocument.text" manifest:full-path="/"/>
-  <manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>
-</manifest:manifest>`);
-  zip.file("styles.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"/>`);
-
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  zip.file("content.xml", buildOdtContent(odtParagraphs));
+  zip.file("META-INF/manifest.xml", buildOdtManifest("application/vnd.oasis.opendocument.text"));
+  zip.file("styles.xml", `<?xml version="1.0" encoding="UTF-8"?><office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"/>`);
+  return ((await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" })) as Uint8Array).buffer;
 }
 
 async function odtToDocx(data: ArrayBuffer): Promise<ArrayBuffer> {
   const JSZip = (await import("npm:jszip@3.10.1")).default;
   const srcZip = await JSZip.loadAsync(data);
-
   const contentXml = await srcZip.file("content.xml")?.async("string");
   if (!contentXml) throw new Error("No se pudo leer content.xml del ODT");
 
-  // Extract paragraphs from ODT
   const paragraphs = extractOdtParagraphs(contentXml);
+  const docxParagraphs = paragraphs
+    .map((p) =>
+      `<w:p><w:pPr/>${p.runs.map((r) => `<w:r><w:rPr/><w:t xml:space="preserve">${escapeXml(r)}</w:t></w:r>`).join("")}</w:p>`
+    )
+    .join("\n");
 
-  // Build DOCX document.xml
-  const docxParagraphs = paragraphs.map(p => {
-    const runs = p.runs.map(r =>
-      `<w:r><w:rPr/><w:t xml:space="preserve">${escapeXml(r)}</w:t></w:r>`
-    ).join("");
-    return `<w:p><w:pPr/>${runs}</w:p>`;
-  }).join("\n");
-
-  const zip = new JSZip();
-  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>`);
-  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`);
-  zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
-  <w:body>
-    ${docxParagraphs}
-  </w:body>
-</w:document>`);
-  zip.file("word/_rels/document.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`);
-
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  return buildDocx(docxParagraphs);
 }
 
-// ── DOCX/ODT -> RTF helpers ───────────────────────────
+// ── DOCX/ODT -> RTF ───────────────────────────────────
 
 async function docxToRtf(data: ArrayBuffer): Promise<ArrayBuffer> {
   const JSZip = (await import("npm:jszip@3.10.1")).default;
   const srcZip = await JSZip.loadAsync(data);
   const docXml = await srcZip.file("word/document.xml")?.async("string");
   if (!docXml) throw new Error("No se pudo leer document.xml");
-
-  const paragraphs = extractDocxParagraphs(docXml);
-  return buildRtf(paragraphs);
+  return buildRtf(extractDocxParagraphs(docXml));
 }
 
 async function odtToRtf(data: ArrayBuffer): Promise<ArrayBuffer> {
@@ -377,102 +300,59 @@ async function odtToRtf(data: ArrayBuffer): Promise<ArrayBuffer> {
   const srcZip = await JSZip.loadAsync(data);
   const contentXml = await srcZip.file("content.xml")?.async("string");
   if (!contentXml) throw new Error("No se pudo leer content.xml");
-
-  const paragraphs = extractOdtParagraphs(contentXml);
-  return buildRtf(paragraphs);
+  return buildRtf(extractOdtParagraphs(contentXml));
 }
 
 function buildRtf(paragraphs: { runs: string[] }[]): ArrayBuffer {
-  const rtfParas = paragraphs.map(p => {
-    const text = p.runs.join("").replace(/[{}\\]/g, (c) => `\\${c === "\\" ? "\\\\" : c === "{" ? "\\{" : "\\}"}`);
-    return `${text}\\par`;
-  }).join("\n");
-
-  const rtf = `{\\rtf1\\ansi\\deff0
-{\\fonttbl{\\f0 Calibri;}{\\f1 Arial;}}
-{\\colortbl;\\red0\\green0\\blue0;}
-\\f0\\fs22
-${rtfParas}
-}`;
+  const rtfParas = paragraphs
+    .map((p) => {
+      const text = p.runs
+        .join("")
+        .replace(/\\/g, "\\\\")
+        .replace(/\{/g, "\\{")
+        .replace(/\}/g, "\\}");
+      return `${text}\\par`;
+    })
+    .join("\n");
+  const rtf = `{\\rtf1\\ansi\\deff0\n{\\fonttbl{\\f0 Calibri;}}\n{\\colortbl;\\red0\\green0\\blue0;}\n\\f0\\fs22\n${rtfParas}\n}`;
   return new TextEncoder().encode(rtf).buffer;
 }
 
-// ── RTF -> DOCX/ODT helpers ───────────────────────────
+// ── RTF -> DOCX/ODT ───────────────────────────────────
 
 async function rtfToDocx(data: ArrayBuffer): Promise<ArrayBuffer> {
   const paragraphs = extractRtfParagraphs(data);
-
-  const JSZip = (await import("npm:jszip@3.10.1")).default;
-  const docxParagraphs = paragraphs.map(p => {
-    const runs = p.runs.map(r =>
-      `<w:r><w:rPr/><w:t xml:space="preserve">${escapeXml(r)}</w:t></w:r>`
-    ).join("");
-    return `<w:p><w:pPr/>${runs}</w:p>`;
-  }).join("\n");
-
-  const zip = new JSZip();
-  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>`);
-  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>`);
-  zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <w:body>${docxParagraphs}</w:body>
-</w:document>`);
-  zip.file("word/_rels/document.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`);
-
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  const docxParagraphs = paragraphs
+    .map((p) =>
+      `<w:p><w:pPr/>${p.runs.map((r) => `<w:r><w:rPr/><w:t xml:space="preserve">${escapeXml(r)}</w:t></w:r>`).join("")}</w:p>`
+    )
+    .join("\n");
+  return buildDocx(docxParagraphs);
 }
 
 async function rtfToOdt(data: ArrayBuffer): Promise<ArrayBuffer> {
-  const paragraphs = extractRtfParagraphs(data);
-
   const JSZip = (await import("npm:jszip@3.10.1")).default;
-  const odtParagraphs = paragraphs.map(p => {
-    const runs = p.runs.map(r => `<text:span>${escapeXml(r)}</text:span>`).join("");
-    return `<text:p>${runs}</text:p>`;
-  }).join("\n");
+  const paragraphs = extractRtfParagraphs(data);
+  const odtParagraphs = paragraphs
+    .map((p) => `<text:p>${p.runs.map((r) => `<text:span>${escapeXml(r)}</text:span>`).join("")}</text:p>`)
+    .join("\n");
 
   const zip = new JSZip();
   zip.file("mimetype", "application/vnd.oasis.opendocument.text", { compression: "STORE" });
-  zip.file("content.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content
-  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
-  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-  office:version="1.2">
-  <office:body><office:text>${odtParagraphs}</office:text></office:body>
-</office:document-content>`);
-  zip.file("META-INF/manifest.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
-  <manifest:file-entry manifest:media-type="application/vnd.oasis.opendocument.text" manifest:full-path="/"/>
-  <manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>
-</manifest:manifest>`);
-
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  zip.file("content.xml", buildOdtContent(odtParagraphs));
+  zip.file("META-INF/manifest.xml", buildOdtManifest("application/vnd.oasis.opendocument.text"));
+  return ((await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" })) as Uint8Array).buffer;
 }
 
-// ── PPTX <-> ODP helpers ──────────────────────────────
+// ── PPTX <-> ODP ──────────────────────────────────────
 
 async function pptxToOdp(data: ArrayBuffer): Promise<ArrayBuffer> {
   const JSZip = (await import("npm:jszip@3.10.1")).default;
   const srcZip = await JSZip.loadAsync(data);
 
-  // Find all slide files
   const slideFiles: string[] = [];
   srcZip.forEach((path) => {
-    if (/^ppt\/slides\/slide\d+\.xml$/.test(path)) {
-      slideFiles.push(path);
-    }
+    if (/^ppt\/slides\/slide\d+\.xml$/.test(path)) slideFiles.push(path);
   });
   slideFiles.sort((a, b) => {
     const na = parseInt(a.match(/slide(\d+)/)?.[1] || "0");
@@ -480,27 +360,22 @@ async function pptxToOdp(data: ArrayBuffer): Promise<ArrayBuffer> {
     return na - nb;
   });
 
-  // Extract text from each slide
   const slides: { texts: string[] }[] = [];
   for (const slidePath of slideFiles) {
     const slideXml = await srcZip.file(slidePath)?.async("string");
-    if (slideXml) {
-      const texts = extractPptxSlideTexts(slideXml);
-      slides.push({ texts });
-    }
+    if (slideXml) slides.push({ texts: extractPptxSlideTexts(slideXml) });
   }
 
-  // Build ODP
-  const odpPages = slides.map((slide, i) => {
-    const textContent = slide.texts.map(t =>
-      `<text:p>${escapeXml(t)}</text:p>`
-    ).join("\n");
-    return `<draw:page draw:name="slide${i + 1}" draw:id="page${i + 1}" draw:style-name="dp1">
+  const odpPages = slides
+    .map((slide, i) => {
+      const textContent = slide.texts.map((t) => `<text:p>${escapeXml(t)}</text:p>`).join("\n");
+      return `<draw:page draw:name="slide${i + 1}" draw:id="page${i + 1}" draw:style-name="dp1">
       <draw:frame svg:width="24cm" svg:height="16cm" draw:style-name="pr1">
         <draw:text-box>${textContent}</draw:text-box>
       </draw:frame>
     </draw:page>`;
-  }).join("\n");
+    })
+    .join("\n");
 
   const zip = new JSZip();
   zip.file("mimetype", "application/vnd.oasis.opendocument.presentation", { compression: "STORE" });
@@ -516,33 +391,19 @@ async function pptxToOdp(data: ArrayBuffer): Promise<ArrayBuffer> {
     <style:style style:name="dp1" style:family="drawing-page"/>
     <style:style style:name="pr1" style:family="presentation"/>
   </office:automatic-styles>
-  <office:body>
-    <office:presentation>
-      ${odpPages}
-    </office:presentation>
-  </office:body>
+  <office:body><office:presentation>${odpPages}</office:presentation></office:body>
 </office:document-content>`);
-  zip.file("META-INF/manifest.xml", `<?xml version="1.0" encoding="UTF-8"?>
-<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
-  <manifest:file-entry manifest:media-type="application/vnd.oasis.opendocument.presentation" manifest:full-path="/"/>
-  <manifest:file-entry manifest:media-type="text/xml" manifest:full-path="content.xml"/>
-</manifest:manifest>`);
-
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  zip.file("META-INF/manifest.xml", buildOdtManifest("application/vnd.oasis.opendocument.presentation", "content.xml"));
+  return ((await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" })) as Uint8Array).buffer;
 }
 
 async function odpToPptx(data: ArrayBuffer): Promise<ArrayBuffer> {
   const JSZip = (await import("npm:jszip@3.10.1")).default;
   const srcZip = await JSZip.loadAsync(data);
-
   const contentXml = await srcZip.file("content.xml")?.async("string");
   if (!contentXml) throw new Error("No se pudo leer content.xml del ODP");
 
-  // Extract pages and their text content from ODP
   const pages = extractOdpPages(contentXml);
-
-  // Build PPTX with all slides
   const zip = new JSZip();
 
   const slideRels: string[] = [];
@@ -554,19 +415,18 @@ async function odpToPptx(data: ArrayBuffer): Promise<ArrayBuffer> {
     const rId = `rId${slideNum + 1}`;
     slideRels.push(`<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${slideNum}.xml"/>`);
     slideContentTypes.push(`<Override PartName="/ppt/slides/slide${slideNum}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`);
+    slideEntries.push(`<p:sldId id="${256 + i}" r:id="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>`);
 
-    const sldId = 256 + i;
-    slideEntries.push(`<p:sldId id="${sldId}" r:id="${rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>`);
-
-    // Build slide XML with all text content
-    const textShapes = pages[i].texts.map((t, j) => {
-      const yOff = 274638 + j * 457200;
-      return `<p:sp>
-  <p:nvSpPr><p:cNvPr id="${j + 1}" name="Text ${j + 1}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+    const textShapes = pages[i].texts
+      .map((t, j) => {
+        const yOff = 274638 + j * 457200;
+        return `<p:sp>
+  <p:nvSpPr><p:cNvPr id="${j + 2}" name="Text ${j + 1}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
   <p:spPr><a:xfrm xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:off x="457200" y="${yOff}"/><a:ext cx="8229600" cy="457200"/></a:xfrm></p:spPr>
   <p:txBody xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="es" dirty="0"/><a:t>${escapeXml(t)}</a:t></a:r></a:p></p:txBody>
 </p:sp>`;
-    }).join("\n");
+      })
+      .join("\n");
 
     zip.file(`ppt/slides/slide${slideNum}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -574,9 +434,7 @@ async function odpToPptx(data: ArrayBuffer): Promise<ArrayBuffer> {
   xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <p:cSld><p:spTree><p:nvGrpSpPr/><p:grpSpPr/>${textShapes}</p:spTree></p:cSld>
 </p:sld>`);
-
-    zip.file(`ppt/slides/_rels/slide${slideNum}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`);
+    zip.file(`ppt/slides/_rels/slide${slideNum}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`);
   }
 
   zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -594,8 +452,7 @@ async function odpToPptx(data: ArrayBuffer): Promise<ArrayBuffer> {
 
   zip.file("ppt/presentation.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-  saveSubsetFonts="1">
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" saveSubsetFonts="1">
   <p:sldIdLst>${slideEntries.join("\n    ")}</p:sldIdLst>
 </p:presentation>`);
 
@@ -604,41 +461,74 @@ async function odpToPptx(data: ArrayBuffer): Promise<ArrayBuffer> {
   ${slideRels.join("\n  ")}
 </Relationships>`);
 
-  const blob = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
-  return blob.buffer;
+  return ((await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" })) as Uint8Array).buffer;
+}
+
+// ── Shared builders ───────────────────────────────────
+
+async function buildDocx(docxParagraphs: string): Promise<ArrayBuffer> {
+  const JSZip = (await import("npm:jszip@3.10.1")).default;
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`);
+  zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>${docxParagraphs}</w:body>
+</w:document>`);
+  zip.file("word/_rels/document.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`);
+  return ((await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" })) as Uint8Array).buffer;
+}
+
+function buildOdtContent(bodyContent: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  office:version="1.2">
+  <office:body><office:text>${bodyContent}</office:text></office:body>
+</office:document-content>`;
+}
+
+function buildOdtManifest(mediaType: string, extraFile = "content.xml"): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+  <manifest:file-entry manifest:media-type="${mediaType}" manifest:full-path="/"/>
+  <manifest:file-entry manifest:media-type="text/xml" manifest:full-path="${extraFile}"/>
+</manifest:manifest>`;
 }
 
 // ── XML Parsing Helpers ───────────────────────────────
 
 function extractDocxParagraphs(xml: string): { runs: string[] }[] {
   const paragraphs: { runs: string[] }[] = [];
-  // Split by <w:p> tags
   const pRegex = /<w:p[ >][\s\S]*?<\/w:p>/g;
   let pMatch;
   while ((pMatch = pRegex.exec(xml)) !== null) {
     const pXml = pMatch[0];
     const runs: string[] = [];
-    // Extract text from <w:t> tags within this paragraph
     const tRegex = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g;
     let tMatch;
     while ((tMatch = tRegex.exec(pXml)) !== null) {
       runs.push(unescapeXml(tMatch[1]));
     }
-    if (runs.length > 0) {
-      paragraphs.push({ runs });
-    }
+    if (runs.length > 0) paragraphs.push({ runs });
   }
-  // If no paragraphs found with structured parsing, try a simpler approach
   if (paragraphs.length === 0) {
+    const allRuns: string[] = [];
     const tRegex = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g;
     let tMatch;
-    const allRuns: string[] = [];
-    while ((tMatch = tRegex.exec(xml)) !== null) {
-      allRuns.push(unescapeXml(tMatch[1]));
-    }
-    if (allRuns.length > 0) {
-      paragraphs.push({ runs: allRuns });
-    }
+    while ((tMatch = tRegex.exec(xml)) !== null) allRuns.push(unescapeXml(tMatch[1]));
+    if (allRuns.length > 0) paragraphs.push({ runs: allRuns });
   }
   return paragraphs;
 }
@@ -650,27 +540,20 @@ function extractOdtParagraphs(xml: string): { runs: string[] }[] {
   while ((pMatch = pRegex.exec(xml)) !== null) {
     const pContent = pMatch[1];
     const runs: string[] = [];
-    // Extract text from <text:span> or direct text content
     const spanRegex = /<text:span[^>]*>([\s\S]*?)<\/text:span>/g;
     let sMatch;
-    while ((sMatch = spanRegex.exec(pContent)) !== null) {
-      runs.push(unescapeXml(sMatch[1]));
+    while ((sMatch = spanRegex.exec(pContent)) !== null) runs.push(unescapeXml(sMatch[1]));
+    if (runs.length === 0) {
+      const stripped = pContent.replace(/<[^>]+>/g, "").trim();
+      if (stripped) runs.push(unescapeXml(stripped));
     }
-    // Also get any direct text nodes (not inside spans)
-    const stripped = pContent.replace(/<[^>]+>/g, "").trim();
-    if (stripped && runs.length === 0) {
-      runs.push(unescapeXml(stripped));
-    }
-    if (runs.length > 0) {
-      paragraphs.push({ runs });
-    }
+    if (runs.length > 0) paragraphs.push({ runs });
   }
   return paragraphs;
 }
 
 function extractPptxSlideTexts(xml: string): string[] {
   const texts: string[] = [];
-  // Extract all <a:t> text elements from the slide
   const tRegex = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
   let match;
   while ((match = tRegex.exec(xml)) !== null) {
@@ -685,11 +568,10 @@ function extractOdpPages(xml: string): { texts: string[] }[] {
   const pageRegex = /<draw:page[^>]*>([\s\S]*?)<\/draw:page>/g;
   let pMatch;
   while ((pMatch = pageRegex.exec(xml)) !== null) {
-    const pageContent = pMatch[1];
     const texts: string[] = [];
     const pRegex = /<text:p[^>]*>([\s\S]*?)<\/text:p>/g;
     let tMatch;
-    while ((tMatch = pRegex.exec(pageContent)) !== null) {
+    while ((tMatch = pRegex.exec(pMatch[1])) !== null) {
       const text = tMatch[1].replace(/<[^>]+>/g, "").trim();
       if (text) texts.push(unescapeXml(text));
     }
@@ -700,25 +582,18 @@ function extractOdpPages(xml: string): { texts: string[] }[] {
 
 function extractRtfParagraphs(data: ArrayBuffer): { runs: string[] }[] {
   const text = new TextDecoder("utf-8", { fatal: false }).decode(data);
-  const paragraphs: { runs: string[] }[] = [];
-
-  // Simple RTF text extraction: remove control words, keep text
   const cleaned = text
     .replace(/\\'[0-9a-fA-F]{2}/g, (m) => String.fromCharCode(parseInt(m.slice(2), 16)))
-    .replace(/\\[a-zA-Z]+\d*\s?/g, "") // remove control words
-    .replace(/[{}]/g, "") // remove braces
+    .replace(/\\[a-zA-Z]+\d*[ ]?/g, "")
+    .replace(/[{}]/g, "")
     .replace(/\\\\/g, "\\")
     .replace(/\\{/g, "{")
     .replace(/\\}/g, "}");
-
-  const lines = cleaned.split(/\\par|\\line/).filter(l => l.trim().length > 0);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      paragraphs.push({ runs: [trimmed] });
-    }
-  }
-  return paragraphs;
+  return cleaned
+    .split(/\\par|\\line/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => ({ runs: [l] }));
 }
 
 function escapeXml(s: string): string {
